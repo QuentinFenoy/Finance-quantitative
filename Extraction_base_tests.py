@@ -57,8 +57,8 @@ result=adfuller(r_gold)  # p-value
 print("ADF statistic:", result[0])
 print("p-value:", result[1])
 print("Critical values:", result[4])
-#5) QQ plots
 
+#5) QQ plots
 import scipy.stats as stats
 plt.figure()
 
@@ -71,8 +71,8 @@ plt.figure()
 stats.probplot(r_silver, dist="norm", plot=plt)
 plt.title("QQ-plot des log-rendements de l'argent")
 plt.show()
-# 6) Autocorreclations
 
+# 6) Autocorreclation
 from statsmodels.graphics.tsaplots import plot_acf
 
 # ACF des rendements
