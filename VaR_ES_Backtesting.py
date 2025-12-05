@@ -306,3 +306,143 @@ print("\n--- Christoffersen Test (Historical VaR) ---")
 print("LR_cc =", LR_cc, "p-value =", pv_cc) #if p-value>0.05 : model OK (if LR< approx 6)
 print("LR_uc =", LR_uc_val, "LR_ind =", LR_ind)
 print("transitions:", transitions)
+
+
+#EWMA:
+from scipy.stats import norm
+
+# ------------------------------------------------------------
+# 1. Paramètres
+# ------------------------------------------------------------
+
+
+
+
+def portfolio_returns(returns_df, weights):
+
+    # Vérification des dimensions
+    if len(weights) != returns_df.shape[1]:
+        raise ValueError("Le nombre de poids doit correspondre au nombre d'actifs (colonnes) dans returns_df")
+    
+    # Calcul du rendement pondéré
+    port_returns = returns_df.dot(weights)
+    
+    # Retour en pd.Series avec index des dates
+    port_returns = pd.Series(port_returns, index=returns_df.index, name="Portfolio_Return")
+    
+    return port_returns
+
+
+
+def compute_exceptions(portfolio_returns, VaR_array):
+    """
+    Compte les exceptions pour un portefeuille.
+    
+    Parameters
+    ----------
+    portfolio_returns : pd.Series ou pd.DataFrame
+        Rendements journaliers du portefeuille. Si DataFrame multi-actifs, 
+        il faut que ce soit déjà le rendement agrégé du portefeuille.
+    VaR_array : np.array ou pd.Series
+        VaR journalière du portefeuille, même taille que portfolio_returns.
+    
+    Returns
+    -------
+    exceptions : np.array
+        1 si r < -VaR, 0 sinon
+    n_exceptions : int
+        Nombre total d'exceptions
+    """
+    
+    # S'assurer que les tailles correspondent
+    if len(portfolio_returns) != len(VaR_array):
+        raise ValueError("portfolio_returns et VaR_array doivent avoir la même longueur")
+    
+    # Calcul des exceptions
+    exceptions = (portfolio_returns < -VaR_array).astype(int)
+    n_exceptions = np.sum(exceptions)
+    
+    return exceptions, n_exceptions
+    
+tickers = ["GC=F", "SI=F", "^GSPC"]   # Or, Argent, S&P500 (yfinance)
+weights = np.array([0.4, 0.3, 0.3])   # Poids du portefeuille (modifiable)
+lambda_ = 0.94                        # Paramètre EWMA RiskMetrics
+alpha = 0.95                # Quantile pour la VaR (modifiable)
+
+
+# ------------------------------------------------------------
+# 2. Télécharger les prix
+# ------------------------------------------------------------
+
+data = yf.download(tickers, start="2005-12-05")["Close"]
+returns = np.log(data / data.shift(1)).dropna()
+pf_returns=portfolio_returns(returns, weights)
+
+
+# ------------------------------------------------------------
+# 3. Calcul EWMA de RiskMetrics
+# ------------------------------------------------------------
+
+
+def ewma_cov_matrix(returns, lambda_):
+    T, N = returns.shape
+    cov_matrix = [np.cov(returns.values, rowvar=False)]  # initialisation avec covariance empirique historique
+
+    for t in range(1, T):
+        r_tm1 = returns.iloc[t-1].values.reshape(-1, 1)  # rendement t-1
+        cov_matrix.append(lambda_ * cov_matrix[t-1] + (1 - lambda_) * (r_tm1 @ r_tm1.T)) #Formule: \Sigma_t=\lambda\Sigma_{t-1}+(1-\lambda)r_{t-1}r_{t-1}^T
+
+    return cov_matrix
+
+
+cov_ewma = ewma_cov_matrix(returns, lambda_)
+
+# ------------------------------------------------------------
+# 4. Volatilité du portefeuille
+# ------------------------------------------------------------
+
+portfolio_variance = np.zeros(len(cov_ewma))
+portfolio_vol = np.zeros(len(cov_ewma))
+VaR_array = np.zeros(len(cov_ewma))
+VaR_pct_loss = np.zeros(len(cov_ewma))
+for i in range(len(portfolio_variance)):
+    portfolio_variance[i]=weights @ cov_ewma[i] @ weights.T
+    portfolio_vol[i]=np.sqrt(portfolio_variance[i])
+
+    # ------------------------------------------------------------
+    # 5. Value-at-Risk (VaR)
+    # ------------------------------------------------------------
+
+    VaR_array[i] = norm.ppf(alpha) * portfolio_vol[i]  # VaR en log-return
+
+    # Convertir en pourcentage de perte (approximation)
+    VaR_pct_loss[i] = -(np.exp(-VaR_array[i]) - 1)
+
+# ------------------------------------------------------------
+# 6. Affichage des résultats
+# ------------------------------------------------------------
+
+print("Matrice de covariance EWMA :")
+print(pd.DataFrame(cov_ewma[-1], index=tickers, columns=tickers))
+
+print("\nVolatilité journalière du portefeuille :", round(portfolio_vol[-1], 6))
+print(f"VaR journalière (quantile {alpha}): {VaR_array[-1]:.6f}")
+print(f"VaR journalière en % de perte approx : {VaR_pct_loss[-1]*100:.3f}%")
+#Backtest EWMA
+
+
+p = 1.0 - alpha
+
+exc_hist, n_exc_hist = compute_exceptions(pf_returns, VaR_array)
+
+print("VH:", VaR_array, "Nb exceptions:", n_exc_hist)
+
+LR_uc, pv_uc, x, n = kupiec_LR_from_array(exc_hist, p)
+print("--- Kupiec Test (EWMA VaR) ---")
+print("LR_uc =", LR_uc, "p-value =", pv_uc, "x/n =", x, "/", n)
+
+LR_cc, pv_cc, LR_uc_val, LR_ind, transitions = christoffersen_LR(exc_hist, p)
+print("\n--- Christoffersen Test (EWMA VaR) ---")
+print("LR_cc =", LR_cc, "p-value =", pv_cc)
+print("LR_uc =", LR_uc_val, "LR_ind =", LR_ind)
+print("transitions:", transitions)
