@@ -2,67 +2,6 @@
 Optimiseur de Portefeuille — Mean-Variance (Black-Litterman) + Hierarchical
 Risk Parity + Risk Parity, avec backtest walk-forward réaliste (coûts de
 transaction inclus) et comparaison multi-stratégies.
-=============================================================================
-Historique des changements :
-
-  1–14. [voir versions précédentes]
-
-  15. CORRIGÉ — fetch_market_cap_weights : fallback médiane au lieu de
-      moyenne pour les actifs sans market cap (ETF, GLD). La moyenne était
-      tirée par MSFT (~3 000 Md$) et surestimait le proxy des ETF d'un
-      facteur ~2. La médiane est robuste aux outliers.
-
-  16. CORRIGÉ — perf_metrics : Sharpe calculé sur µ_simple (= µ_log + σ²/2,
-      correction d'Itô) au lieu de µ_log, pour cohérence avec le CAGR affiché.
-      Effet : +σ/2 sur chaque Sharpe (≈ +0.06 pour σ=13%).
-
-  17. CORRIGÉ — backtest_oos : prev_weights initialisé à équipondéré
-      (np.ones(n)/n) au lieu de zéros. Le premier rebalancement ne génère
-      plus de coût fictif de ~100% × cost_bps.
-
-  18. CORRIGÉ — optimize_portfolio (target_vol) : contrainte de vol en
-      ÉGALITÉ (vol = target) au lieu d'inégalité (vol ≤ target). Évite
-      que l'optimiseur choisisse une vol inférieure à la cible quand µ BL
-      est partout négatif. Fallback sur l'inégalité si non convergence.
-
-  19. CORRIGÉ — _build_ml_features : normalisation cross-sectionelle des
-      features à chaque date (z-score entre actifs). Le signal ML est
-      maintenant relatif entre actifs plutôt qu'absolu.
-
-  20. CORRIGÉ — _build_combined_views : court-circuit analyst si w_analyst=0
-      pour éviter les appels yfinance inutiles lors du backtest.
-
-  21. CORRIGÉ — BUG CRITIQUE : désalignement tickers ↔ colonnes de retours.
-      yf.download() avec une liste de tickers renvoie les colonnes TRIÉES
-      ALPHABÉTIQUEMENT, pas dans l'ordre passé par l'utilisateur. Or
-      fetch_market_cap_weights(tickers) et views_from_analyst(tickers, ...)
-      étaient appelés avec la liste `tickers` ORIGINALE (ordre utilisateur)
-      partout en aval, alors que cov_matrix/mu_hist sont indexés selon
-      l'ordre alphabétique de `returns.columns`. Dans black_litterman :
-          pi = delta * cov_matrix @ w_market
-      ce produit associait positionnellement la covariance de l'actif i
-      (ordre alphabétique) au poids de marché de l'actif i (ordre original)
-      — des actifs DIFFÉRENTS. Le prior pi (et donc tout le posterior mu_bl)
-      était corrompu pour toute liste de tickers non déjà triée
-      alphabétiquement. Idem pour le P-matrix de views_from_analyst.
-      FIX : juste après fetch_returns(), on réassigne
-          tickers = list(returns.columns)
-      et on propage CET ordre canonique partout en aval (run_optimizer,
-      run_backtest, run_backtest_compare). backtest_oos() faisait déjà ça
-      correctement en interne (tickers = list(returns.columns)), mais
-      recevait un w_market pré-calculé avec le mauvais ordre depuis les
-      fonctions appelantes — corrigé également.
-
-  22. CORRIGÉ — saturation du signal momentum : avec signal_scale=0.30 et
-      z_clip=2.0, tout |z| > 0.5 dépassait q_cap_momentum=0.15 et était
-      clippé. Le signal devenait quasi binaire (±15% pour la majorité des
-      actifs) au lieu d'être gradué. Nouveau défaut signal_scale=0.07
-      (= q_cap / z_clip), pour que le clip ne touche que les vraies queues
-      de distribution (|z| proche de z_clip) plutôt que la majorité des cas.
-
-  ⚠️ Rappels :
-  - HRP / Risk Parity ignorent mu — leur Sharpe dépend uniquement de Σ.
-  - Ceci est un outil d'aide à la décision, pas un conseil en investissement.
 """
 
 import warnings
@@ -175,16 +114,6 @@ def fetch_returns(
     tickers: list[str], period: str = "5y", use_cache: bool = True,
     target_currency: str = "EUR",
 ) -> pd.DataFrame:
-    """
-    ⚠️ IMPORTANT [CORRECTION 21] : yfinance renvoie les colonnes triées
-    ALPHABÉTIQUEMENT, pas dans l'ordre de `tickers`. Tout code appelant
-    cette fonction doit, juste après l'appel, faire :
-        tickers = list(returns.columns)
-    avant d'utiliser `tickers` pour indexer quoi que ce soit dérivé de
-    `returns` (market caps, views, etc.). Cette fonction ne peut pas le
-    faire elle-même car elle ne fait que retourner les retours — c'est aux
-    appelants de réaligner leur référence locale `tickers`.
-    """
     key = (tuple(tickers), period, target_currency)
     if use_cache and key in _RETURNS_CACHE:
         return _RETURNS_CACHE[key].copy()
@@ -233,16 +162,6 @@ def fetch_market_cap_weights(
 ) -> np.ndarray:
     """
     Double tentative : fast_info d'abord, puis info["marketCap"] en fallback.
-
-    [CORRECTION 15] Les actifs sans market cap (ETF, matières premières)
-    reçoivent la MÉDIANE des caps valides comme proxy ordinal neutre.
-    Avant : moyenne, tirée par MSFT (~3 000 Md$) → proxy ~1 300 Md$.
-    Après : médiane → proxy ~500-700 Md$, bien plus représentatif.
-
-    ⚠️ [CORRECTION 21] L'ordre du vecteur retourné suit STRICTEMENT l'ordre
-    de `tickers` passé en argument. L'appelant DOIT donc passer
-    `list(returns.columns)` (ordre alphabétique réel) et non la liste
-    utilisateur brute, sous peine de désalignement avec cov_matrix.
     """
     caps, missing_idx = [], []
 
@@ -322,14 +241,6 @@ def views_from_momentum(
     q_cap: float = 0.15,
     tau: float = 0.05,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """
-    [CORRECTION 22] signal_scale par défaut abaissé de 0.30 à 0.07
-    (≈ q_cap / z_clip = 0.15 / 2.0). Avec l'ancienne valeur, tout |z| > 0.5
-    dépassait déjà q_cap et était clippé : le signal devenait quasi binaire
-    (la majorité des actifs collés à ±q_cap) au lieu d'être gradué selon
-    l'intensité réelle du momentum. Avec 0.07, seuls les |z| proches de
-    z_clip (vraies queues de distribution) atteignent le cap.
-    """
     n = len(returns.columns)
     if len(returns) < lookback_long + skip_recent:
         return None, None, None
@@ -408,13 +319,6 @@ def views_from_analyst(
     analyst_confidence_scale: float = 2.5,
     tau: float = 0.05,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """
-    ⚠️ [CORRECTION 21] `tickers` DOIT être dans le même ordre que les
-    colonnes de `cov_matrix` (i.e. list(returns.columns)), car `ticker_idx`
-    sert directement à positionner les colonnes de la matrice P qui
-    multiplie cov_matrix. Un tickers désaligné produit un P qui pointe
-    sur les mauvais actifs.
-    """
     implied = fetch_analyst_implied_returns(tickers, returns, q_cap=q_cap,
                                             analyst_confidence_scale=analyst_confidence_scale)
     if not implied:
@@ -438,18 +342,6 @@ def views_from_analyst(
 # ── 4c. ML Ridge cross-sectionnel ────────────────────────────────────────────
 
 def _build_ml_features(returns: pd.DataFrame, end_idx: int) -> np.ndarray | None:
-    """
-    Features cross-sectionelles pour Ridge, avec normalisation cross-sectionelle.
-
-    [CORRECTION 19] Chaque feature est z-scorée ENTRE les actifs à chaque date,
-    avant stacking temporel. Cela rend le signal relatif (ASML est relativement
-    volatil) plutôt qu'absolu (ASML a une vol de 39%), ce qui est économiquement
-    pertinent pour un modèle cross-sectionnel.
-
-    Sans cette correction, le StandardScaler temporal normalisait des valeurs
-    déjà hétérogènes entre actifs, forçant Ridge à apprendre des niveaux absolus
-    (IBCI est toujours peu volatil) plutôt que des déviations relatives.
-    """
     min_required = 252 + 14
     if end_idx < min_required:
         return None
@@ -664,14 +556,6 @@ def black_litterman(
     return_posterior_cov: bool = False,
     w_market: np.ndarray | None = None,
 ):
-    """
-    ⚠️ [CORRECTION 21] `w_market`, si fourni explicitement par l'appelant,
-    DOIT être indexé dans le même ordre que `cov_matrix` / `returns.columns`.
-    Sinon `pi = delta * cov_matrix @ w_market` mélange les actifs entre eux.
-    Si `w_market` est None, il est recalculé ici via
-    `fetch_market_cap_weights(list(returns.columns))`, qui est toujours
-    dans le bon ordre.
-    """
     n = cov_matrix.shape[0]
     if w_market is None:
         w_market = fetch_market_cap_weights(list(returns.columns))
@@ -812,9 +696,6 @@ def min_achievable_vol(
 ) -> float:
     """
     Volatilité minimale atteignable sous les contraintes de poids.
-    [CORRECTION 18] Accepte maintenant bounds et budget_constraint pour être
-    cohérent avec l'optimisation réelle (l'ancienne version utilisait
-    bounds=[(0,1)] sans min_weight/max_weight, ce qui surestimait la faisabilité).
     """
     n = cov_matrix.shape[0]
     if bounds is None:
@@ -843,13 +724,6 @@ def optimize_portfolio(
     mu_override: np.ndarray | None = None,
     vol_cov_matrix: np.ndarray | None = None,
 ) -> dict:
-    """
-    [CORRECTION 18] Pour objective='target_vol', la contrainte de vol est
-    maintenant une ÉGALITÉ (vol = target_vol) au lieu d'une inégalité
-    (vol ≤ target_vol). Cela évite que l'optimiseur choisisse une vol
-    inférieure à la cible quand µ BL est partout négatif.
-    Fallback automatique sur l'inégalité si non convergence.
-    """
     n       = len(returns.columns)
     mu      = mu_override if mu_override is not None else returns.mean().values * 252
     vol_cov = vol_cov_matrix if vol_cov_matrix is not None else cov_matrix
@@ -999,11 +873,6 @@ def _build_combined_views(
     tau: float = 0.05,
     verbose: bool = False,
 ) -> tuple:
-    """
-    ⚠️ [CORRECTION 21] `tickers` doit être dans l'ordre de `returns.columns`
-    (= ordre de `cov_matrix`). Tous les appelants (run_optimizer,
-    run_backtest*, backtest_oos) respectent désormais cette contrainte.
-    """
     if bl_views_P is not None and bl_views_Q is not None:
         return bl_views_P, bl_views_Q, bl_views_Omega, "utilisateur"
 
@@ -1028,8 +897,7 @@ def _build_combined_views(
             for row in range(P_mom.shape[0]):
                 col = np.argmax(np.abs(P_mom[row]))
                 q_mom_arr[col] = Q_mom[row]
-
-    # [CORRECTION 20] Court-circuit si w_analyst == 0 → évite les appels yfinance
+              
     if use_analyst_views and w_analyst > 0.0:
         P_ana, Q_ana, Omega_ana = views_from_analyst(
             tickers=tickers, returns=returns, cov_matrix=cov_matrix,
@@ -1185,11 +1053,6 @@ def run_optimizer(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def perf_metrics(daily_log_rets: pd.Series, risk_free_rate: float = 0.04) -> dict:
-    """
-    [CORRECTION 16] Sharpe calculé sur µ_simple (= µ_log + σ²/2) pour
-    cohérence avec le CAGR. L'ancienne version utilisait µ_log, ce qui
-    sous-estimait le Sharpe de σ/2 (≈ +0.065 pour σ=13%).
-    """
     ann_vol        = daily_log_rets.std() * np.sqrt(252)
     ann_ret_log    = daily_log_rets.mean() * 252
     ann_ret_simple = ann_ret_log + 0.5 * ann_vol ** 2  # correction d'Itô
@@ -1226,21 +1089,13 @@ def backtest_oos(
     view_confidence_scale_fused: float = 1.5,
     w_market: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, list]:
-    """
-    `tickers` est dérivé ici de `returns.columns` (déjà correct dans la
-    version originale). [CORRECTION 21] Le `w_market` reçu en argument doit
-    désormais, lui aussi, être garanti aligné par l'appelant
-    (run_backtest / run_backtest_compare) — c'est corrigé dans ces deux
-    fonctions.
-    """
+
     n       = returns.shape[1]
     tickers = list(returns.columns)
     if w_market is None:
         w_market = fetch_market_cap_weights(tickers)
 
     strat, eqw, idx, w_hist = [], [], [], []
-
-    # [CORRECTION 17] Départ équipondéré au lieu de zéros.
     # Évite un coût fictif de ~100% × cost_bps au premier rebalancement.
     prev_weights = np.ones(n) / n
 
@@ -1408,7 +1263,6 @@ def run_backtest_compare(
     view_confidence_scale_fused=1.5,
 ):
     returns = fetch_returns(tickers, period)
-    # [CORRECTION 21] Réalignement avant tout calcul dérivé de l'ordre des tickers.
     tickers  = list(returns.columns)
     w_market = fetch_market_cap_weights(tickers)
 
@@ -1499,11 +1353,6 @@ if __name__ == "__main__":
         "MC.PA",      # LVMH — EUR, Euronext Paris
         "SAP.DE",     # SAP — EUR, Xetra
         "BTC-USD", 
-    ]
-    # ⚠️ Note : cette liste est passée telle quelle à fetch_returns(), mais
-    # CHAQUE fonction (run_optimizer, run_backtest, run_backtest_compare) la
-    # réaligne désormais en interne sur l'ordre réel des colonnes retournées
-    # par yfinance ([CORRECTION 21]) — aucune action requise ici.
 
     TOTAL_AMOUNT = 3_000.0
     TARGET_VOL   = 0.15
