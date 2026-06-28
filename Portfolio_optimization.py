@@ -145,6 +145,31 @@ def _convert_prices_to_currency(prices: pd.DataFrame, tickers: list[str],
         print(f"   💱 {ticker} : {ccy} → {target_currency} (taux {target_currency}{ccy}=X)")
     return converted
 
+def _convert_market_cap_to_currency(
+    market_cap: float,
+    from_currency: str | None,
+    target_currency: str,
+    period: str = "1mo",
+) -> float:
+    """
+    Convertit une capitalisation boursière vers la devise cible.
+    """
+
+    if (
+        market_cap is None
+        or from_currency is None
+        or from_currency == target_currency
+    ):
+        return market_cap
+
+    fx_close = _fetch_fx_series(target_currency, from_currency, period)
+
+    if fx_close is None or fx_close.empty:
+        return market_cap
+
+    fx = float(fx_close.iloc[-1])
+
+    return market_cap / fx
 
 def fetch_returns(
     tickers: list[str], period: str = "5y", use_cache: bool = True,
@@ -233,8 +258,17 @@ def fetch_market_cap_weights(
             _MKTCAP_CACHE[ticker] = mc if (mc and mc > 0) else None
 
         mc = _MKTCAP_CACHE[ticker]
+
         if mc:
-            caps.append(float(mc))
+            currency = _get_ticker_currency(ticker)
+
+            mc = _convert_market_cap_to_currency(
+                market_cap=float(mc),
+                from_currency=currency,
+                target_currency="EUR",
+            )
+
+            caps.append(mc)
         else:
             caps.append(None)
             missing_idx.append(i)
@@ -1100,7 +1134,7 @@ def run_optimizer(
     print(f"\n  ℹ️  Source des views BL : {views_label}")
 
     mu_hist = returns.mean().values * 252
-    
+
     # Black-Litterman retourne des rendements excédentaires
     mu_bl_excess, M_post = black_litterman(
         cov_matrix=cov_matrix,
@@ -1115,12 +1149,12 @@ def run_optimizer(
         return_posterior_cov=True,
         w_market=w_market,
     )
-    
+
     # Conversion en rendements absolus
     mu_bl = mu_bl_excess + risk_free_rate
-    
+
     print_bl_summary(tickers, mu_hist, mu_bl, w_market)
-    
+
     mu_for_opt = shrink_mu(mu_bl, mu_shrink_factor)
     if mu_shrink_factor < 1.0:
         print(f"  ℹ️  mu_shrink_factor={mu_shrink_factor}")
@@ -1250,10 +1284,10 @@ def backtest_oos(
             return_posterior_cov=True,
             w_market=w_market,
         )
-        
+
         # Conversion en rendement absolu
         mu_bl_w = mu_bl_excess_w + risk_free_rate
-        
+
         mu_w = shrink_mu(mu_bl_w, mu_shrink_factor)
         vol_cov_w = (cov + M_w) if use_posterior_cov else None
 
@@ -1453,15 +1487,18 @@ def run_backtest_compare(
 if __name__ == "__main__":
 
     TICKERS = [
+        "NVDA",       # Nvidia — USD, semi-conducteurs 
+        "GOOGL",      # Alphabet — USD, tech 
+        "TTE.PA",     # TotalEnergies — EUR, énergie, Euronext Paris
+        "OR.PA",      # L'Oréal — EUR, consommation, Euronext Paris
+        "SIE.DE",     # Siemens — EUR, industrie, Xetra
+        "SLV",        # iShares Silver Trust — USD, métal précieux (comme GLD : pas de market cap → fallback médiane)
         "MSFT",       # Microsoft — USD
         "ASML.AS",    # ASML — EUR, Euronext Amsterdam
-        "NOVO-B.CO",  # Novo Nordisk — DKK, Copenhagen
         "IWDA.AS",    # iShares MSCI World — EUR
-        "IEGA.AS",    # iShares EUR Govt Bond — EUR
-        "IBCI.AS",    # iShares EUR Inflation-Linked — EUR
-        "GLD",        # SPDR Gold Shares — USD
         "MC.PA",      # LVMH — EUR, Euronext Paris
         "SAP.DE",     # SAP — EUR, Xetra
+        "BTC-USD", 
     ]
     # ⚠️ Note : cette liste est passée telle quelle à fetch_returns(), mais
     # CHAQUE fonction (run_optimizer, run_backtest, run_backtest_compare) la
@@ -1473,8 +1510,8 @@ if __name__ == "__main__":
     PERIOD       = "10y"
     RF           = 0.04
     OBJECTIVE    = "target_vol"
-    MAX_W        = 0.25
-    MIN_W        = 0.02
+    MAX_W        = 0.3
+    MIN_W        = 0.0
     COST_BPS     = 10.0
 
     BL_DELTA     = 4.0
@@ -1502,9 +1539,9 @@ if __name__ == "__main__":
     ML_Q_CAP     = 0.12
     ML_CONF      = 1.3
 
-    W_MOM        = 0.60
+    W_MOM        = 0.70
     W_ANA        = 0.0   # 0 → appels analyst automatiquement désactivés
-    W_ML         = 0.40
+    W_ML         = 0.30
     CONF_FUSED   = 0.8
 
     BL_VIEWS_P     = None
